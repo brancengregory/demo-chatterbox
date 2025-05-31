@@ -10,4 +10,7 @@ wheels/
 .venv
 
 # Data
-data/input/
+input.txt
+test.wav
+data/
+.Rproj.user

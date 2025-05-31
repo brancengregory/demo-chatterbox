@@ -1,0 +1,215 @@
+# **A Unified System for Research Artifact Management, Observability, and Discovery**
+
+https://www.mermaidchart.com/raw/9d8793d8-ef85-4c68-9f91-febaab5856e5?theme=light&version=v0.1&format=svg
+
+## **1. Introduction**
+
+This document outlines a cohesive architecture for managing research artifacts, focusing on robust storage, versioning, comprehensive observability, standardized discovery, and secure access control. The system leverages Google Cloud services, the emerging DuckLake table format, open standards like OpenTelemetry, OpenLineage, DCAT, and Dublin Core, and a suite of R packages to create a powerful, transparent, and secure research data ecosystem. The publishr R package serves as the primary user gateway to this system.
+
+## **2. Core System Architecture: The Foundation**
+
+The system is built upon four key architectural planes:
+
+- **A. Data Plane: Artifact Storage (Google Cloud Storage - GCS)**
+    - All research artifacts (datasets as Parquet files, models, reports, images, HTML files, CSVs, etc.) are stored in GCS buckets.
+    - A clear, consistent naming convention and folder structure (e.g., gs://[your-bucket-name]/project_name/artifact_type/artifact_name/version_id/file.ext) is crucial for organization.
+    - Parquet is the preferred format for tabular data, optimizing for performance with DuckDB and DuckLake, but original formats are also supported.
+- **B. Metadata Plane: Catalog Database (Google Cloud SQL - PostgreSQL with DuckLake)**
+    - A Google Cloud SQL PostgreSQL instance serves as the central metadata catalog.
+    - **DuckLake's Role:** DuckLake defines and manages the schema of metadata tables within this PostgreSQL database. These tables store:
+        - Pointers to data files in GCS.
+        - Schema definitions of datasets (where applicable).
+        - Version information for all artifacts.
+        - Custom metadata (descriptions, tags, authors, pipeline run IDs, source information, etc.).
+    - This approach leverages PostgreSQL's ACID transaction capabilities, ensuring metadata consistency and integrity, a core tenet of DuckLake's design.
+- **C. Interaction & Processing Layer (DuckDB with DuckLake Extension)**
+    - DuckDB, augmented with the DuckLake extension, acts as the primary engine for interacting with this ecosystem.
+    - It connects to the Cloud SQL PostgreSQL instance (the DuckLake catalog) and accesses artifact files directly from GCS.
+    - This layer handles the creation, updating, and querying of the metadata catalog as well as data retrieval.
+- **D. Authentication and Authorization (AuthX) Layer**
+    - This layer controls access to the data and metadata, ensuring that only authorized users and services can perform specific actions.
+    - It integrates with Google Cloud IAM and potentially other identity providers (e.g., via OAuth 2.0).
+    - Manages roles, groups, and resource-based policies to define permissions for creating, reading, updating, deleting, and sharing artifacts.
+
+## **3. The publishr R Package: Gateway to the Ecosystem**
+
+The publishr R package provides a user-friendly interface for analysts, abstracting the complexities of the underlying storage, metadata, observability, and security components.
+
+- **Key Functionalities:**
+    - **Initialization & Configuration:** Manages secure connections to GCS (for artifact storage) and Cloud SQL PostgreSQL (for the DuckLake catalog). Also configures endpoints for OpenTelemetry, OpenLineage, and the AuthX layer.
+    - **Authentication:** Handles user authentication against the AuthX layer.
+    - **Authorization:** Enforces access control policies defined in the AuthX layer for all operations.
+    - **Publishing Artifacts (Including Simple Files and Non-Tabular Data):**
+        - Handles formal publishing of processed artifacts (e.g., converting tabular data to Parquet, detailed metadata capture).
+        - Includes streamlined processes for simple file uploads (e.g., CSVs, images, HTML reports) using functions like publishr::publish_raw_file().
+            - This function authenticates the user, prompts for essential metadata, uploads the file in its original format to a designated GCS path, and registers the file in the DuckLake catalog.
+        - For tabular data, publishr::publish_artifact() can handle conversion to Parquet and richer schema capture.
+    - **Discovering & Listing Artifacts:** Queries the DuckLake catalog (Postgres), filtering results based on the user's permissions, to find artifacts based on names, projects, tags, etc.
+    - **Loading Artifacts:**
+        - Authenticates and authorizes the user.
+        - Queries the DuckLake catalog to get the GCS path and schema (if applicable) for the requested artifact and version.
+        - Uses DuckDB (with the DuckLake extension) to directly read files from GCS into R.
+    - **Generating Shareable Links:**
+        - Provides functions like publishr::create_shareable_link() to generate secure, time-limited download links (GCS signed URLs) for specific artifacts. This process includes authentication of the sharer, authorization checks, and logging of the sharing event.
+
+## **4. Comprehensive Observability Framework**
+
+To provide insights into pipeline performance and data provenance, publishr integrates with OpenTelemetry and OpenLineage.
+
+- **A. OpenTelemetry Integration (Metrics, Traces, Logs):**
+    - **Instrumentation:** Key publishr functions (e.g., publish_artifact, load_artifact) are wrapped in OpenTelemetry spans for tracing execution flow and identifying bottlenecks.
+    - **Metrics:** Emits metrics such as artifact counts, sizes, operation durations, and error rates.
+    - **Logging:** Enhanced logging, potentially correlated with traces.
+    - **Backend:** An OpenTelemetry Collector receives this data and forwards it to backends like Google Cloud Operations Suite (Cloud Trace, Monitoring, Logging), Prometheus, or Grafana.
+- **B. OpenLineage Integration (Data Provenance):**
+    - **Event Emission:** When publishr publishes an artifact, especially one derived from others, it constructs and sends an OpenLineage JSON event.
+    - **Event Content:** Includes Job (e.g., R script name, targets pipeline run ID), Inputs (source artifacts with versions), and Outputs (the newly published artifact with its version, GCS path, schema, and other facets).
+    - **Backend:** Events are sent to an OpenLineage-compliant endpoint, such as a Marquez instance or potentially custom storage.
+
+## **5. Public Data Discovery and Access API**
+
+To make research artifacts discoverable and accessible in a standardized and secure way, a Plumber API is deployed on Google Cloud Run.
+
+- **A. Cloud Run Plumber API:**
+    - A stateless, scalable R Plumber application serves as the API.
+    - Connects securely to the Cloud SQL PostgreSQL database (DuckLake catalog) via Cloud SQL Proxy.
+    - Containerized and deployed on Cloud Run.
+- **B. DCAT & Dublin Core Compliance:**
+    - The API exposes metadata about datasets using Data Catalog Vocabulary (DCAT) and Dublin Core standards.
+    - dcat:Dataset entries describe each versioned artifact.
+    - dcat:Distribution entries describe the actual data files in GCS, providing dcat:accessURL (GCS URI) or dcat:downloadURL (e.g., GCS signed URLs for controlled HTTP access) and format.
+- **C. OpenAPI Specification:**
+    - Plumber automatically generates an OpenAPI (Swagger) specification (e.g., /openapi.json).
+    - This enables API discoverability, automated client generation, and clear documentation for API consumers.
+    - **Conceptual Endpoints:**
+        - GET /datasets: Lists available datasets with summary metadata, respecting user permissions.
+        - GET /datasets/{dataset_id}: Provides full DCAT/Dublin Core metadata for a specific dataset and its distributions, only if the user is authorized.
+        - POST /datasets/{dataset_id}/versions/{version_id}/create_share_link: Allows authenticated users to generate shareable links.
+- **D. Integration with the AuthX Layer:**
+    - The Plumber API integrates with the AuthX layer to enforce access control.
+    - Requires authentication (e.g., API keys, OAuth 2.0 tokens).
+    - Checks user permissions before returning any data or generating share links.
+
+## **6. Handling Common Ad-hoc Data Needs**
+
+The architecture accommodates common, less formal data handling requests while maintaining governance.
+
+- **A. Quick Ingestion of Local Files (e.g., "I just have this CSV and I need to save it")**
+    - publishr::publish_raw_file() allows users to easily upload files (CSVs, images, etc.) directly.
+    - The user authenticates, provides minimal metadata, and the file is uploaded to GCS and registered in the DuckLake catalog with its original format.
+    - These files become discoverable and versioned, subject to permissions.
+- **B. Controlled External Sharing (e.g., "I just want to share this data with Tim at that organization")**
+    - Secure, auditable sharing via GCS Signed URLs, facilitated by publishr::create_shareable_link() or the API.
+    - The sharer is authenticated and authorized.
+    - A time-limited, revocable URL is generated for the specific artifact version.
+    - Sharing events are logged for governance (who, what, to whom, when, expiration).
+
+## **7. Use Case Q&A: Processing External Partner Data**
+
+This section walks through a common scenario: receiving data from an external partner, processing it within a targets workflow, and managing the resulting artifacts.
+
+**Q1: How do I securely receive and store an initial dataset from an external partner, especially if it's large or sensitive and can't go into GitHub?**
+
+- **Secure External Transfer:** Use agreed-upon secure methods (SFTP, etc.).
+- **Local Staging:** Place in your local project's data/input/.
+- **Internal Publishing (publishr):** Use publishr::publish_raw_file() or publishr::publish_artifact(). Authenticate, provide metadata (name, description, tags, source). publishr uploads to GCS and registers in DuckLake. This makes it a versioned, internally managed artifact.
+
+**Q2: Once this external dataset is published internally, how do I use it in my project's targets flow for processing?**
+
+- **targets Load Step:** Define a target using publishr::load_artifact(name = "...", project = "...", version = "...").
+- **Data Retrieval:** publishr queries DuckLake, gets the GCS path, and reads the data into R.
+- **Dependency:** targets manages this loaded data as a dependency.
+
+**Q3: How are intermediate and final artifacts (e.g., processed tables, HTML reports, Parquet files, plots) generated during the targets workflow managed and published internally?**
+
+- **Processing as Targets:** Define targets for each transformation, report generation, or plot creation.
+- **Publishing as Targets:** For each output to be registered, add a targets step that calls publishr::publish_artifact() (for data to be converted to Parquet) or publishr::publish_raw_file() (for HTML, images, plots in their native format).
+    - Pass the data object or file path to the publish function.
+    - Include descriptive metadata and derived_from information for lineage.
+- **publishr Automation:** Handles data conversion (if applicable), GCS upload, DuckLake registration, OpenLineage event emission, and OpenTelemetry data generation.
+- **Data Validation:** pointblank validation steps within targets ensure data quality *before* publishing.
+
+**Q4: What if I need to share either the initial raw dataset or some of the processed artifacts with an external collaborator?**
+
+- **Initiate Sharing:** Use publishr::create_shareable_link() or the API.
+- **Security:** The sharer is authenticated/authorized. A time-limited GCS signed URL is generated.
+- **Audit Trail:** The sharing event is logged.
+- **Recipient Access:** The collaborator gets a direct HTTPS download link.
+
+## **8. Handling Non-Tabular Data (Images, HTML, Plots)**
+
+Non-tabular artifacts like images, HTML reports, and plots are first-class citizens in this system:
+
+- **Unified Storage:** Stored in the same GCS bucket structure as tabular data, organized by project and artifact type (e.g., gs://[your-bucket-name]/project_alpha/reports/final_report_v2.html).
+- **publishr Management:** publishr::publish_raw_file() is used to upload these files in their native format to GCS and register them in the DuckLake catalog.
+- **DuckLake Catalog:** Stores GCS paths, file formats (e.g., image/png, text/html), versions, and all other relevant metadata, just like tabular data.
+- **API Discoverability:** The API exposes metadata for these non-tabular artifacts, and can generate signed URLs for secure downloads.
+
+## **9. Versioning and Time Travel for All Artifacts**
+
+A key benefit of this architecture is comprehensive versioning and "time travel" capabilities, provided by DuckLake's metadata management, for *all* registered artifacts:
+
+- Every time an artifact (tabular data, image, HTML report, plot, etc.) is published or updated via publishr, a new version is recorded in the DuckLake catalog, pointing to the specific file(s) in GCS for that version.
+- Users can retrieve specific past versions of any artifact by specifying the version identifier in publishr::load_artifact() or through API queries.
+- This provides a complete, auditable history of all research outputs, enhancing reproducibility and allowing for easy rollback or comparison across versions.
+
+## **10. Guidance on Metadata and Lineage Granularity**
+
+A common concern when adopting a comprehensive artifact management system is the perceived overhead of metadata generation and lineage tracking. This system is designed to be practical and focuses on capturing metadata and lineage at meaningful junctures, not for every micro-transformation within an analyst's workflow.
+
+- **Focus on Published Artifacts:** Metadata (including schema for tabular data) and formal cross-pipeline lineage (via OpenLineage) are primarily captured when an artifact is explicitly published using `ojopublishr`. This typically occurs for:
+    - **Initial raw or externally sourced datasets:** This includes original files like PDFs, CSVs from partners, or the first set of tables extracted from such unstructured or semi-structured sources.
+    - **Significant intermediate datasets:** These are datasets that have undergone key cleaning, transformation, or aggregation steps and are likely to be reused by other processes, analysts, or serve as a stable checkpoint.
+    - **Final output datasets, models, reports, or plots:** These are the end products of an analysis or pipeline.
+- **Handling Unstructured Data to Structured Data Pipelines (e.g., PDF Scraping):**
+    - **Source Registration:** The original unstructured file (e.g., a PDF document provided by a partner) can itself be registered as a raw artifact using `ojopublishr::publish_raw_file()`. Its "location" could be its GCS path (if you've uploaded it) or an authoritative URL. This registered PDF artifact becomes the traceable input for lineage purposes.
+    - **Extraction Process as the "Job":** Your R functions or scripts that parse the PDF and generate tabular data represent the key transformation "job" in lineage terms.
+    - **Publishing Extracted Tables:** The resulting rectangular tables are then published using `ojopublishr::publish_artifact()`. At this point:
+        - Their schema is captured (often automatically by `arrow` when converting to Parquet).
+        - Descriptive metadata (name, description, tags, source notes) is provided by the analyst.
+        - Lineage is established by `ojopublishr` (via OpenLineage), linking these new tables back to the source PDF artifact and identifying the extraction script/job.
+- **Intra-Workflow Transformations (e.g., within a `targets` pipeline or a single R script):**
+    - **No Need to Publish Every Intermediate DataFrame:** Analysts do **not** need to use `ojopublishr` to publish every single intermediate data frame created during a sequence of `dplyr` operations (e.g., `filter()`, `mutate()`, `select()`, `group_by()`, `summarise()`) or other transformations *unless* that intermediate result is itself a significant, reusable, or shareable artifact as defined above.
+    - **`targets` for Fine-Grained Intra-Pipeline Provenance:** The `targets` R package inherently provides reproducibility and tracks dependencies for all intermediate R objects and steps *within that specific pipeline's execution*. This fine-grained, internal provenance is invaluable for debugging, understanding, and efficiently re-running that particular workflow. It serves a different purpose than the broader, cross-pipeline lineage captured by OpenLineage for *published and shared artifacts*.
+    - **Analyst Discretion for Publishing:** The decision of when an intermediate dataset becomes "significant enough" to publish rests with the analyst or team, based on its potential for reuse, its role as a key checkpoint, or the need to share it formally.
+- **Practical Metadata Effort:**
+    - **Descriptive Metadata:** This is provided by the analyst at the point of publishing a key artifact – a point where its purpose and significance are clear.
+    - **Schema:** For tabular data published with `ojopublishr::publish_artifact()`, the schema is largely inferred automatically during conversion (e.g., to Parquet). DuckLake's versioning handles schema evolution when new versions of artifacts are published.
+    - **Focus on Value, Not Bureaucracy:** The goal is to make the process of sharing, discovering, and understanding valuable data assets straightforward and robust, not to create undue documentation burden for every analytical step. The system aims to capture information that enhances collaboration, reproducibility, and trust in the data.
+
+## **11. Potential Future Enhancements**
+
+The system is designed to be extensible. Potential future enhancements include:
+
+1. **Data Validation & Quality Assurance Layer (via targets and pointblank)**:
+    - **Implementation:** Integrate data validation using the targets R package, with the pointblank R package for defining and executing validation plans.
+    - **How it fits:** targets manages execution of pointblank validation steps. Failures can halt downstream processing. Validation reports can be versioned artifacts, and summaries stored as metadata.
+2. **Workflow Orchestration (via targets)**:
+    - **Implementation:** The targets R package serves as the primary workflow orchestration tool for R-based pipelines.
+    - **How it fits:** targets defines sequence, dependencies, and execution of scripts. publishr functions are called within these targets-managed pipelines.
+3. **Dedicated User Interface / Data Portal (via a Shiny App or CKAN)**:
+    - **Implementation:** A Shiny app will serve as an interactive web-based Data Portal.
+    - **How it fits:** Acts as a front-end to the Plumber API, allowing users to browse, search, view metadata, and initiate downloads.
+4. **Integrated Notification Layer (via ojonotifier R package)**:
+    - **Implementation:** A new R package, ojonotifier, will handle notifications, initially using slackr for Slack, extensible to other platforms.
+    - **How it fits:** Called from targets pipelines, publishr, or the API for alerts on events like new versions or pipeline status.
+5. **Advanced Search & Discovery (via DuckDB FTS or Embedded Rust Utilities)**:
+    - **Implementation:** Explore DuckDB's Full-Text Search (FTS) extensions or embedded search utilities (e.g., in Rust).
+    - **How it fits:** Provides powerful text-based search against metadata, exposed via the API or Shiny app.
+
+## **12. Synergies and Key Advantages**
+
+This integrated architecture offers significant benefits:
+
+- **End-to-End Security & Governance:** The AuthX layer and controlled sharing mechanisms ensure data is protected and shared appropriately, with auditable trails.
+- **Practical Flexibility:** Handles both highly structured research pipelines and common ad-hoc requests for simple storage and sharing.
+- **Atomicity & Consistency:** DuckLake's use of SQL transactions for metadata ensures a reliable and consistent catalog.
+- **Standardization & Interoperability:** Open formats, standard metadata (DCAT/Dublin Core), and open protocols (OpenTelemetry, OpenLineage) enhance interoperability.
+- **Comprehensive Versioning:** All artifacts, including non-tabular ones, are versioned with time-travel capabilities.
+- **End-to-End Visibility:** Combines operational insights (OpenTelemetry) with data provenance (OpenLineage).
+- **Improved Reproducibility & Debugging:** Clear lineage, version history, and operational traces simplify troubleshooting and reproducing results.
+- **Enhanced Discoverability & Accessibility:** The API layer makes data easily findable and usable by a wider audience and automated systems, while maintaining security.
+- **Scalability & Performance:** Leverages scalable Google Cloud services and efficient data processing with DuckDB.
+- **Centralized Management via publishr:** Provides a consistent and user-friendly R-centric experience for analysts.
+
+This system provides a robust, secure, and modern foundation for managing, observing, and sharing research artifacts.
